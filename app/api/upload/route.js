@@ -1,11 +1,9 @@
 // app/api/upload/route.js
-export const runtime = 'nodejs';        // 强制 Node 运行时（不是 Edge）
-export const dynamic = 'force-dynamic'; // 避免被静态化
-export const maxDuration = 60;          // Vercel 无服务器函数最长执行秒数
-
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../lib/prisma';
 import { parseXlsxToFacts } from '../../../lib/excel';
+
+const UPSERT_CONCURRENCY = 20; // 每批并发 upsert 数，别太大
 
 export async function POST(req) {
   try {
@@ -15,51 +13,60 @@ export async function POST(req) {
       return NextResponse.json({ message: 'No file selected' }, { status: 400 });
     }
 
-    // 可选：限制 10MB
-    if (file.size > 10 * 1024 * 1024) {
-      return NextResponse.json({ message: 'File too large' }, { status: 413 });
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const records = parseXlsxToFacts(bytes); 
+    if (!records.length) {
+      return NextResponse.json({ message: 'No rows parsed from Excel' }, { status: 400 });
     }
 
-    // 用 Buffer 读取（云端最稳）
-    const buffer = Buffer.from(await file.arrayBuffer());
-    const records = parseXlsxToFacts(buffer); 
-    // records: [{ product_name, external_id?, date, open_inv, proc_qty, proc_price, sales_qty, sales_price }]
-
-    // 建产品键：优先 external_id，没有就用名称
-    const keys = new Map();
+    // 1) 归一化 key（优先 external_id，其次 product_name）
+    const keyInfo = new Map(); // key -> { external_id, product_name }
     for (const r of records) {
       const key = r.external_id ? `id:${r.external_id}` : `name:${r.product_name}`;
-      if (!keys.has(key)) keys.set(key, { external_id: r.external_id || null, product_name: r.product_name });
+      if (!keyInfo.has(key)) keyInfo.set(key, { external_id: r.external_id || null, product_name: r.product_name });
     }
 
     const keyToPid = new Map();
 
-    await prisma.$transaction(async (tx) => {
-      // 先确保/创建产品
-      for (const [key, { external_id, product_name }] of keys.entries()) {
-        let p;
-        if (external_id) {
-          p = await tx.product.findFirst({ where: { external_id } });
-          if (!p) {
-            p = await tx.product.create({ data: { product_name, external_id } });
-          } else if (product_name && p.product_name !== product_name) {
-            p = await tx.product.update({
-              where: { product_id: p.product_id },
-              data: { product_name },
-            });
-          }
-        } else {
-          p = await tx.product.findFirst({ where: { product_name } });
-          if (!p) p = await tx.product.create({ data: { product_name } });
-        }
-        keyToPid.set(key, p.product_id);
-      }
+    // 2) 查已有 product（按 external_id / name 分开查）
+    const extIds = [...new Set([...keyInfo.values()].map(x => x.external_id).filter(Boolean))];
+    if (extIds.length) {
+      const existByExt = await prisma.product.findMany({
+        where: { external_id: { in: extIds } },
+        select: { product_id: true, external_id: true },
+      });
+      for (const p of existByExt) keyToPid.set(`id:${p.external_id}`, p.product_id);
+    }
 
-      // 写入/更新日度事实
-      for (const r of records) {
-        const key = r.external_id ? `id:${r.external_id}` : `name:${r.product_name}`;
-        const product_id = keyToPid.get(key);
-        await tx.dailyFact.upsert({
+    const names = [...new Set([...keyInfo.values()].filter(x => !x.external_id).map(x => x.product_name))];
+    if (names.length) {
+      const existByName = await prisma.product.findMany({
+        where: { product_name: { in: names } },
+        select: { product_id: true, product_name: true },
+      });
+      for (const p of existByName) keyToPid.set(`name:${p.product_name}`, p.product_id);
+    }
+
+    // 3) 补建缺失的 product（逐个创建，避免长事务）
+    for (const [key, { external_id, product_name }] of keyInfo.entries()) {
+      if (keyToPid.has(key)) continue;
+      const created = await prisma.product.create({ data: { product_name, external_id } });
+      keyToPid.set(key, created.product_id);
+    }
+
+    // 4) 分批 upsert DailyFact（无事务，小批并发）
+    let batch = [];
+    const flush = async () => {
+      if (!batch.length) return;
+      await Promise.all(batch);
+      batch = [];
+    };
+
+    for (const r of records) {
+      const key = r.external_id ? `id:${r.external_id}` : `name:${r.product_name}`;
+      const product_id = keyToPid.get(key);
+      batch.push(
+        prisma.dailyFact.upsert({
           where: { product_id_date: { product_id, date: r.date } },
           create: {
             product_id,
@@ -77,14 +84,19 @@ export async function POST(req) {
             sales_qty: r.sales_qty ?? 0,
             sales_price: r.sales_price ?? 0,
           },
-        });
+        })
+      );
+
+      if (batch.length >= UPSERT_CONCURRENCY) {
+        await flush();
       }
-    });
+    }
+    await flush();
 
     return NextResponse.json({ ok: true });
   } catch (err) {
+    // 保留日志，方便在 Vercel Logs 里定位
     console.error('Upload parse/write error:', err);
-    // 把具体错误信息返回，便于你在云端看到原因
-    return NextResponse.json({ message: err?.message || '解析或入库失败' }, { status: 500 });
+    return NextResponse.json({ message: 'Parsing or insertion failed' }, { status: 500 });
   }
 }
