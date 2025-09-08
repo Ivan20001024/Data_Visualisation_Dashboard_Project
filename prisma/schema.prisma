@@ -1,0 +1,43 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+/* 
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+*/ // local
+
+datasource db {
+  provider = "postgresql"        // online
+  url      = env("DATABASE_URL") 
+}
+
+model User {
+  username_id   Int    @id @default(autoincrement())
+  username      String @unique
+  password_hash String
+}
+
+model Product {
+  product_id   Int         @id @default(autoincrement())
+  product_name String
+  external_id  String?     @unique
+  daily_facts  DailyFact[]
+}
+
+model DailyFact {
+  product_id   Int
+  date         DateTime
+  open_inv     Int
+  proc_qty     Int
+  proc_price   Float
+  sales_qty    Int
+  sales_price  Float
+
+  product Product @relation(fields: [product_id], references: [product_id])
+
+  @@id([product_id, date])
+  @@index([product_id, date])
+}
