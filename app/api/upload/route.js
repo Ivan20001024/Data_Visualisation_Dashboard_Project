@@ -1,66 +1,64 @@
+// app/api/upload/route.js
+export const runtime = 'nodejs';        // 强制 Node 运行时（不是 Edge）
+export const dynamic = 'force-dynamic'; // 避免被静态化
+export const maxDuration = 60;          // Vercel 无服务器函数最长执行秒数
+
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../lib/prisma';
 import { parseXlsxToFacts } from '../../../lib/excel';
-import { getServerSession } from 'next-auth';
-import { authOptions } from '../../../lib/authOptions';
-
-function nsExternalId(rawId, userId, productName) {
-  if (rawId && String(rawId).trim()) {
-    return `u${userId}::${String(rawId).trim()}`;
-  }
-  return `u${userId}__NAME__${String(productName || '').trim()}`;
-}
 
 export async function POST(req) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session) return NextResponse.json({ message: 'Unauthorized' }, { status: 401 });
-    const userId = Number(session.user.id);
-
     const form = await req.formData();
     const file = form.get('file');
-    if (!file) return NextResponse.json({ message: 'No file selected' }, { status: 400 });
-
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    const records = parseXlsxToFacts(bytes);
-
-    const nsRecords = records.map(r => ({
-      ...r,
-      external_id: nsExternalId(r.external_id, userId, r.product_name),
-    }));
-
-    const uniqNsIds = [...new Set(nsRecords.map(r => r.external_id))];
-
-    const existing = await prisma.product.findMany({
-      where: { external_id: { in: uniqNsIds } },
-      select: { product_id: true, external_id: true, product_name: true }
-    });
-    const idToPid = new Map(existing.map(p => [p.external_id, p.product_id]));
-
-    for (const nsid of uniqNsIds) {
-      if (!idToPid.has(nsid)) {
-        const any = nsRecords.find(r => r.external_id === nsid);
-        const created = await prisma.product.create({
-          data: { product_name: any.product_name, external_id: nsid },
-          select: { product_id: true, external_id: true }
-        });
-        idToPid.set(created.external_id, created.product_id);
-      } else {
-        const pid = idToPid.get(nsid);
-        const any = nsRecords.find(r => r.external_id === nsid);
-        const current = existing.find(p => p.external_id === nsid);
-        if (any?.product_name && current && current.product_name !== any.product_name) {
-          await prisma.product.update({
-            where: { product_id: pid },
-            data: { product_name: any.product_name }
-          });
-        }
-      }
+    if (!file) {
+      return NextResponse.json({ message: 'No file selected' }, { status: 400 });
     }
 
+    // 可选：限制 10MB
+    if (file.size > 10 * 1024 * 1024) {
+      return NextResponse.json({ message: 'File too large' }, { status: 413 });
+    }
+
+    // 用 Buffer 读取（云端最稳）
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const records = parseXlsxToFacts(buffer); 
+    // records: [{ product_name, external_id?, date, open_inv, proc_qty, proc_price, sales_qty, sales_price }]
+
+    // 建产品键：优先 external_id，没有就用名称
+    const keys = new Map();
+    for (const r of records) {
+      const key = r.external_id ? `id:${r.external_id}` : `name:${r.product_name}`;
+      if (!keys.has(key)) keys.set(key, { external_id: r.external_id || null, product_name: r.product_name });
+    }
+
+    const keyToPid = new Map();
+
     await prisma.$transaction(async (tx) => {
-      for (const r of nsRecords) {
-        const product_id = idToPid.get(r.external_id);
+      // 先确保/创建产品
+      for (const [key, { external_id, product_name }] of keys.entries()) {
+        let p;
+        if (external_id) {
+          p = await tx.product.findFirst({ where: { external_id } });
+          if (!p) {
+            p = await tx.product.create({ data: { product_name, external_id } });
+          } else if (product_name && p.product_name !== product_name) {
+            p = await tx.product.update({
+              where: { product_id: p.product_id },
+              data: { product_name },
+            });
+          }
+        } else {
+          p = await tx.product.findFirst({ where: { product_name } });
+          if (!p) p = await tx.product.create({ data: { product_name } });
+        }
+        keyToPid.set(key, p.product_id);
+      }
+
+      // 写入/更新日度事实
+      for (const r of records) {
+        const key = r.external_id ? `id:${r.external_id}` : `name:${r.product_name}`;
+        const product_id = keyToPid.get(key);
         await tx.dailyFact.upsert({
           where: { product_id_date: { product_id, date: r.date } },
           create: {
@@ -78,7 +76,7 @@ export async function POST(req) {
             proc_price: r.proc_price ?? 0,
             sales_qty: r.sales_qty ?? 0,
             sales_price: r.sales_price ?? 0,
-          }
+          },
         });
       }
     });
@@ -86,6 +84,7 @@ export async function POST(req) {
     return NextResponse.json({ ok: true });
   } catch (err) {
     console.error('Upload parse/write error:', err);
-    return NextResponse.json({ message: 'Parsing or insertion failed' }, { status: 500 });
+    // 把具体错误信息返回，便于你在云端看到原因
+    return NextResponse.json({ message: err?.message || '解析或入库失败' }, { status: 500 });
   }
 }
